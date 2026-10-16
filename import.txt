@@ -1,0 +1,315 @@
+// =====================================================================
+// Metro Operations - Relational (SQLite) to Neo4j migration script
+// Sydney Group 21 - Assessment 4, Task 2
+// Target: Neo4j 5.26 LTS / 2025.x  (+ Graph Data Science 2.x for Tasks 4-5)
+//
+// HOW TO RUN
+//   1. Copy every file from the /csv folder of the repository into the
+//      database's import directory (Neo4j Desktop: ... > Open folder > Import).
+//   2. Run the statements below in order in Neo4j Browser (enable
+//      "multi-statement query editor") or with cypher-shell:
+//         cypher-shell -u neo4j -p <pwd> -f import.txt
+//   3. The script is idempotent (MERGE + IF NOT EXISTS) and can be re-run.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// STEP 0 (optional) - clear a previous load
+// ---------------------------------------------------------------------
+// MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS;
+
+
+// ---------------------------------------------------------------------
+// STEP 1 - Uniqueness constraints (each also creates a backing range index)
+//          These replace the PRIMARY KEY / UNIQUE constraints of SQLite.
+// ---------------------------------------------------------------------
+CREATE CONSTRAINT metroline_id IF NOT EXISTS FOR (l:MetroLine) REQUIRE l.lineId IS UNIQUE;
+CREATE CONSTRAINT metroline_code IF NOT EXISTS FOR (l:MetroLine) REQUIRE l.lineCode IS UNIQUE;
+CREATE CONSTRAINT route_id IF NOT EXISTS FOR (r:Route) REQUIRE r.routeId IS UNIQUE;
+CREATE CONSTRAINT route_code IF NOT EXISTS FOR (r:Route) REQUIRE r.routeCode IS UNIQUE;
+CREATE CONSTRAINT station_id IF NOT EXISTS FOR (s:Station) REQUIRE s.stationId IS UNIQUE;
+CREATE CONSTRAINT station_code IF NOT EXISTS FOR (s:Station) REQUIRE s.stationCode IS UNIQUE;
+CREATE CONSTRAINT platform_key IF NOT EXISTS FOR (p:Platform) REQUIRE (p.stationId, p.platformNo) IS UNIQUE;
+CREATE CONSTRAINT train_id IF NOT EXISTS FOR (t:Train) REQUIRE t.trainId IS UNIQUE;
+CREATE CONSTRAINT train_fleet IF NOT EXISTS FOR (t:Train) REQUIRE t.fleetNumber IS UNIQUE;
+CREATE CONSTRAINT trip_id IF NOT EXISTS FOR (t:Trip) REQUIRE t.tripId IS UNIQUE;
+CREATE CONSTRAINT trip_code IF NOT EXISTS FOR (t:Trip) REQUIRE t.tripCode IS UNIQUE;
+CREATE CONSTRAINT staff_id IF NOT EXISTS FOR (s:Staff) REQUIRE s.staffId IS UNIQUE;
+CREATE CONSTRAINT staff_empno IF NOT EXISTS FOR (s:Staff) REQUIRE s.employeeNumber IS UNIQUE;
+CREATE CONSTRAINT driver_licence IF NOT EXISTS FOR (d:Driver) REQUIRE d.licenceNumber IS UNIQUE;
+CREATE CONSTRAINT tech_toolkit IF NOT EXISTS FOR (t:Technician) REQUIRE t.toolkitAssetTag IS UNIQUE;
+CREATE CONSTRAINT shift_id IF NOT EXISTS FOR (s:Shift) REQUIRE s.shiftId IS UNIQUE;
+CREATE CONSTRAINT allocation_id IF NOT EXISTS FOR (a:DriverAllocation) REQUIRE a.allocationId IS UNIQUE;
+CREATE CONSTRAINT disruption_id IF NOT EXISTS FOR (d:ServiceDisruption) REQUIRE d.disruptionId IS UNIQUE;
+CREATE CONSTRAINT maintenance_id IF NOT EXISTS FOR (m:MaintenanceLog) REQUIRE m.maintenanceId IS UNIQUE;
+
+
+// ---------------------------------------------------------------------
+// STEP 2 - Secondary indexes (query-driven, see report section 3.4)
+// ---------------------------------------------------------------------
+// Range indexes on frequently filtered node properties
+CREATE INDEX trip_service_date IF NOT EXISTS FOR (t:Trip) ON (t.serviceDate);
+CREATE INDEX trip_status IF NOT EXISTS FOR (t:Trip) ON (t.tripStatus);
+CREATE INDEX trip_date_status IF NOT EXISTS FOR (t:Trip) ON (t.serviceDate, t.tripStatus);
+CREATE INDEX train_status IF NOT EXISTS FOR (t:Train) ON (t.serviceStatus);
+CREATE INDEX disruption_severity IF NOT EXISTS FOR (d:ServiceDisruption) ON (d.severityLevel);
+CREATE INDEX disruption_start IF NOT EXISTS FOR (d:ServiceDisruption) ON (d.startDateTime);
+CREATE INDEX disruption_source IF NOT EXISTS FOR (d:ServiceDisruption) ON (d.sourceId);
+CREATE INDEX maintenance_date IF NOT EXISTS FOR (m:MaintenanceLog) ON (m.maintenanceDate);
+CREATE INDEX shift_date IF NOT EXISTS FOR (s:Shift) ON (s.shiftDate);
+CREATE INDEX station_interchange IF NOT EXISTS FOR (s:Station) ON (s.isInterchange);
+// Relationship property indexes
+CREATE INDEX affects_impact IF NOT EXISTS FOR ()-[a:AFFECTS]-() ON (a.impactType);
+CREATE INDEX stops_at_seq IF NOT EXISTS FOR ()-[s:STOPS_AT]-() ON (s.stopSequence);
+CREATE INDEX calls_at_seq IF NOT EXISTS FOR ()-[c:CALLS_AT]-() ON (c.stopSequence);
+// Text and full-text indexes for name look-ups / search boxes
+CREATE TEXT INDEX station_name_text IF NOT EXISTS FOR (s:Station) ON (s.stationName);
+CREATE FULLTEXT INDEX station_search IF NOT EXISTS FOR (s:Station) ON EACH [s.stationName, s.suburb];
+CREATE FULLTEXT INDEX staff_search IF NOT EXISTS FOR (s:Staff) ON EACH [s.firstName, s.lastName];
+
+// Wait until all indexes are ONLINE before loading
+CALL db.awaitIndexes(300);
+
+
+// ---------------------------------------------------------------------
+// STEP 3 - Nodes (one LOAD CSV per relational entity table)
+// ---------------------------------------------------------------------
+
+// 3.1 MetroLine  (metro_line.csv)
+LOAD CSV WITH HEADERS FROM 'file:///metro_line.csv' AS row
+MERGE (l:MetroLine {lineId: toInteger(row.LineID)})
+SET l.lineCode        = row.LineCode,
+    l.lineName        = row.LineName,
+    l.routeLengthKm   = toFloat(row.RouteLengthKm),
+    l.operatingStatus = row.OperatingStatus;
+
+// 3.2 Station  (station.csv)
+LOAD CSV WITH HEADERS FROM 'file:///station.csv' AS row
+MERGE (s:Station {stationId: toInteger(row.StationID)})
+SET s.stationCode         = row.StationCode,
+    s.stationName         = row.StationName,
+    s.suburb              = row.Suburb,
+    s.stationType         = row.StationType,
+    s.isInterchange       = (row.IsInterchange = '1'),
+    s.accessibilityRating = row.AccessibilityRating;
+
+// 3.3 Platform - weak entity, identified by owner StationID + PlatformNo (platform.csv)
+LOAD CSV WITH HEADERS FROM 'file:///platform.csv' AS row
+MATCH (s:Station {stationId: toInteger(row.StationID)})
+MERGE (p:Platform {stationId: toInteger(row.StationID), platformNo: toInteger(row.PlatformNo)})
+SET p.platformKey     = s.stationCode + '-P' + row.PlatformNo,
+    p.platformLengthM = toFloat(row.PlatformLengthM),
+    p.platformStatus  = row.PlatformStatus
+MERGE (s)-[:HAS_PLATFORM]->(p);
+
+// 3.4 Route  (route.csv) + OPERATES and ORIGINATES_AT (replaces FKs LineID, OriginStationID)
+LOAD CSV WITH HEADERS FROM 'file:///route.csv' AS row
+MATCH (l:MetroLine {lineId: toInteger(row.LineID)})
+MATCH (o:Station   {stationId: toInteger(row.OriginStationID)})
+MERGE (r:Route {routeId: toInteger(row.RouteID)})
+SET r.routeCode            = row.RouteCode,
+    r.routeName            = row.RouteName,
+    r.directionCode        = row.DirectionCode,
+    r.scheduledDurationMin = toInteger(row.ScheduledDurationMin),
+    r.stoppingPattern      = row.StoppingPattern
+MERGE (l)-[:OPERATES]->(r)
+MERGE (r)-[:ORIGINATES_AT]->(o);
+
+// 3.5 Train  (train.csv)
+LOAD CSV WITH HEADERS FROM 'file:///train.csv' AS row
+MERGE (t:Train {trainId: toInteger(row.TrainID)})
+SET t.fleetNumber      = row.FleetNumber,
+    t.commissionedDate = date(row.CommissionedDate),
+    t.odometerKm       = toFloat(row.OdometerKm),
+    t.seatedCapacity   = toInteger(row.SeatedCapacity),
+    t.serviceStatus    = row.ServiceStatus,
+    t.lastOverhaulDate = date(row.LastOverhaulDate);      // empty CSV cell -> null -> property not set
+
+// 3.6 Staff supertype  (staff.csv) - every row gets :Staff
+LOAD CSV WITH HEADERS FROM 'file:///staff.csv' AS row
+MERGE (s:Staff {staffId: toInteger(row.StaffID)})
+SET s.employeeNumber = row.EmployeeNumber,
+    s.firstName      = row.FirstName,
+    s.lastName       = row.LastName,
+    s.hireDate       = date(row.HireDate),
+    s.employmentType = row.EmploymentType,
+    s.staffCategory  = row.StaffCategory;
+
+// 3.7 Multivalued attribute Staff.Phone (staff_phone.csv) -> list property
+LOAD CSV WITH HEADERS FROM 'file:///staff_phone.csv' AS row
+MATCH (s:Staff {staffId: toInteger(row.StaffID)})
+SET s.phones = CASE WHEN row.PhoneNumber IN coalesce(s.phones, [])
+                    THEN s.phones ELSE coalesce(s.phones, []) + row.PhoneNumber END;
+
+// 3.8 Driver subtype (driver.csv) -> extra :Driver label on the same node
+LOAD CSV WITH HEADERS FROM 'file:///driver.csv' AS row
+MATCH (s:Staff {staffId: toInteger(row.StaffID)})
+SET s:Driver,
+    s.licenceNumber           = row.LicenceNumber,
+    s.licenceExpiryDate       = date(row.LicenceExpiryDate),
+    s.certificationLevel      = row.CertificationLevel,
+    s.accumulatedServiceHours = toFloat(row.AccumulatedServiceHours);
+
+// 3.9 Technician subtype (technician.csv) -> extra :Technician label
+LOAD CSV WITH HEADERS FROM 'file:///technician.csv' AS row
+MATCH (s:Staff {staffId: toInteger(row.StaffID)})
+SET s:Technician,
+    s.tradeSpecialisation  = row.TradeSpecialisation,
+    s.safetyClearanceLevel = toInteger(row.SafetyClearanceLevel),
+    s.toolkitAssetTag      = row.ToolkitAssetTag;
+
+// 3.10 Shift  (shift.csv)
+LOAD CSV WITH HEADERS FROM 'file:///shift.csv' AS row
+MERGE (sh:Shift {shiftId: toInteger(row.ShiftID)})
+SET sh.shiftCode  = row.ShiftCode,
+    sh.shiftDate  = date(row.ShiftDate),
+    sh.shiftStart = localtime(row.ShiftStart),
+    sh.shiftEnd   = localtime(row.ShiftEnd),
+    sh.shiftType  = row.ShiftType;
+
+// 3.11 Trip (trip.csv) + SCHEDULES (Route->Trip) and RUNS (Train->Trip)
+LOAD CSV WITH HEADERS FROM 'file:///trip.csv' AS row
+MATCH (r:Route {routeId: toInteger(row.RouteID)})
+MATCH (tr:Train {trainId: toInteger(row.TrainID)})
+MERGE (t:Trip {tripId: toInteger(row.TripID)})
+SET t.tripCode         = row.TripCode,
+    t.serviceDate      = date(row.ServiceDate),
+    t.scheduledArrival = localtime(row.ScheduledArrival),
+    t.actualArrival    = localtime(row.ActualArrival),
+    t.tripStatus       = row.TripStatus,
+    t.occupancyPercent = toFloat(row.OccupancyPercent),
+    t.delayMinutes     = toInteger(row.DelayMinutes)
+MERGE (r)-[:SCHEDULES]->(t)
+MERGE (tr)-[:RUNS]->(t);
+
+// 3.12 ServiceDisruption (service_disruption.csv) + REPORTED (Staff->Disruption)
+LOAD CSV WITH HEADERS FROM 'file:///service_disruption.csv' AS row
+MERGE (d:ServiceDisruption {disruptionId: toInteger(row.DisruptionID)})
+SET d.sourceId          = toInteger(row.SourceID),
+    d.disruptionType    = row.DisruptionType,
+    d.severityLevel     = row.SeverityLevel,
+    d.startDateTime     = localdatetime(row.StartDateTime),
+    d.endDateTime       = localdatetime(row.EndDateTime),
+    d.estimatedDelayMin = toInteger(row.EstimatedDelayMin)
+WITH d, row
+MATCH (s:Staff {staffId: toInteger(row.ReportedByStaffID)})
+MERGE (s)-[:REPORTED]->(d);
+
+// 3.13 MaintenanceLog (maintenance_log.csv) + UNDERWENT (Train->Log) and PERFORMED (Technician->Log)
+LOAD CSV WITH HEADERS FROM 'file:///maintenance_log.csv' AS row
+MATCH (tr:Train {trainId: toInteger(row.TrainID)})
+MATCH (te:Technician {staffId: toInteger(row.TechnicianID)})
+MERGE (m:MaintenanceLog {maintenanceId: toInteger(row.MaintenanceID)})
+SET m.maintenanceDate = date(row.MaintenanceDate),
+    m.category        = row.MaintenanceCategory,
+    m.costAUD         = toFloat(row.CostAUD),
+    m.downtimeHours   = toFloat(row.DowntimeHours),
+    m.outcomeStatus   = row.OutcomeStatus
+MERGE (tr)-[:UNDERWENT]->(m)
+MERGE (te)-[:PERFORMED]->(m);
+
+// 3.14 DriverAllocation - aggregation (Driver x Trip x Shift) kept as an intermediate node
+LOAD CSV WITH HEADERS FROM 'file:///driver_allocation.csv' AS row
+MATCH (dr:Driver {staffId: toInteger(row.StaffID)})
+MATCH (t:Trip    {tripId:  toInteger(row.TripID)})
+MATCH (sh:Shift  {shiftId: toInteger(row.ShiftID)})
+MERGE (a:DriverAllocation {allocationId: toInteger(row.AllocationID)})
+SET a.dutyRole    = row.DutyRole,
+    a.signOnTime  = localtime(row.SignOnTime),
+    a.signOffTime = localtime(row.SignOffTime)
+MERGE (dr)-[:HAS_ALLOCATION]->(a)
+MERGE (a)-[:FOR_TRIP]->(t)
+MERGE (a)-[:IN_SHIFT]->(sh);
+
+
+// ---------------------------------------------------------------------
+// STEP 4 - Relationships from associative (junction) tables
+// ---------------------------------------------------------------------
+
+// 4.1 RouteStop (route_stop.csv) -> (:Route)-[:STOPS_AT {..}]->(:Station)
+LOAD CSV WITH HEADERS FROM 'file:///route_stop.csv' AS row
+MATCH (r:Route   {routeId:   toInteger(row.RouteID)})
+MATCH (s:Station {stationId: toInteger(row.StationID)})
+MERGE (r)-[st:STOPS_AT {stopSequence: toInteger(row.StopSequence)}]->(s)
+SET st.cumulativeDistanceKm = toFloat(row.CumulativeDistanceKm),
+    st.dwellTimeSec         = toInteger(row.DwellTimeSec);
+
+// 4.2 CallsAt (calls_at.csv, ~8.7k rows) -> (:Trip)-[:CALLS_AT {..}]->(:Platform)
+//     Batched so the same statement scales to millions of rows.
+//     (In Neo4j Browser prefix this statement with  :auto )
+LOAD CSV WITH HEADERS FROM 'file:///calls_at.csv' AS row
+CALL (row) {
+  MATCH (t:Trip     {tripId: toInteger(row.TripID)})
+  MATCH (p:Platform {stationId: toInteger(row.StationID), platformNo: toInteger(row.PlatformNo)})
+  MERGE (t)-[c:CALLS_AT {stopSequence: toInteger(row.StopSequence)}]->(p)
+  SET c.scheduledArrival = localtime(row.ScheduledArrival)
+} IN TRANSACTIONS OF 2000 ROWS;
+
+// 4.3 Affects (affects.csv) -> (:ServiceDisruption)-[:AFFECTS {..}]->(:Trip)
+LOAD CSV WITH HEADERS FROM 'file:///affects.csv' AS row
+MATCH (d:ServiceDisruption {disruptionId: toInteger(row.DisruptionID)})
+MATCH (t:Trip              {tripId:       toInteger(row.TripID)})
+MERGE (d)-[a:AFFECTS]->(t)
+SET a.impactType         = row.ImpactType,
+    a.delayMinutes       = toInteger(row.DelayMinutes),
+    a.passengersAffected = toInteger(row.PassengersAffected);
+
+// 4.4 DisruptionSource category/union (disruption_source.csv)
+//     The surrogate DisruptionSource table is dissolved: the disruption points
+//     directly at the Train OR Station that caused it (polymorphic CAUSED_BY).
+LOAD CSV WITH HEADERS FROM 'file:///disruption_source.csv' AS row
+WITH row WHERE row.SourceType = 'Train'
+MATCH (tr:Train {trainId: toInteger(row.TrainID)})
+MATCH (d:ServiceDisruption {sourceId: toInteger(row.SourceID)})
+SET d.sourceType = 'Train'
+MERGE (d)-[:CAUSED_BY]->(tr);
+
+LOAD CSV WITH HEADERS FROM 'file:///disruption_source.csv' AS row
+WITH row WHERE row.SourceType = 'Station'
+MATCH (s:Station {stationId: toInteger(row.StationID)})
+MATCH (d:ServiceDisruption {sourceId: toInteger(row.SourceID)})
+SET d.sourceType = 'Station'
+MERGE (d)-[:CAUSED_BY]->(s);
+
+
+// ---------------------------------------------------------------------
+// STEP 5 - Derived, graph-native relationships (design improvements)
+// ---------------------------------------------------------------------
+
+// 5.1 Trip departure time (first CALLS_AT) stored on the Trip for ordering
+MATCH (t:Trip)-[c:CALLS_AT {stopSequence: 1}]->(:Platform)
+SET t.departureTime = c.scheduledArrival;
+
+// 5.2 NEXT_TRIP: chain the trips a train runs on the same service day
+//     (enables knock-on delay traversal, cf. NEXT in the reference model)
+MATCH (tr:Train)-[:RUNS]->(t:Trip)
+WITH tr, t ORDER BY t.serviceDate, t.departureTime
+WITH tr, t.serviceDate AS day, collect(t) AS runs
+UNWIND range(0, size(runs) - 2) AS i
+WITH runs[i] AS a, runs[i + 1] AS b
+MERGE (a)-[n:NEXT_TRIP]->(b)
+SET n.turnaroundMin = duration.inSeconds(a.scheduledArrival, b.departureTime).seconds / 60;
+
+// 5.3 CONNECTED_TO: physical track segment between adjacent stations,
+//     derived from consecutive stops of all-stops routes. One relationship
+//     per station pair (lowest id -> highest id); query it undirected.
+MATCH (l:MetroLine)-[:OPERATES]->(r:Route {stoppingPattern: 'All Stops'})
+MATCH (r)-[a:STOPS_AT]->(s1:Station), (r)-[b:STOPS_AT]->(s2:Station)
+WHERE b.stopSequence = a.stopSequence + 1
+WITH CASE WHEN s1.stationId < s2.stationId THEN s1 ELSE s2 END AS x,
+     CASE WHEN s1.stationId < s2.stationId THEN s2 ELSE s1 END AS y,
+     l.lineCode AS line,
+     abs(b.cumulativeDistanceKm - a.cumulativeDistanceKm) AS km
+WITH x, y, collect(DISTINCT line) AS lines, round(avg(km), 1) AS km
+MERGE (x)-[c:CONNECTED_TO]->(y)
+SET c.distanceKm = km,
+    c.lines      = lines;
+
+
+// ---------------------------------------------------------------------
+// STEP 6 - Verification
+// ---------------------------------------------------------------------
+MATCH (n) RETURN labels(n) AS labels, count(*) AS nodes ORDER BY nodes DESC;
+MATCH ()-[r]->() RETURN type(r) AS relationship, count(*) AS total ORDER BY total DESC;
+SHOW CONSTRAINTS YIELD name, type, labelsOrTypes, properties;
+SHOW INDEXES YIELD name, type, labelsOrTypes, properties, state;

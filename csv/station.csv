@@ -1,0 +1,33 @@
+StationID,StationCode,StationName,Suburb,StationType,IsInterchange,AccessibilityRating
+1,CHW,Chatswood,Chatswood,Interchange Hub,1,Full
+2,ART,Artarmon,Artarmon,Surface,0,Partial
+3,STL,St Leonards,St Leonards,Underground,0,Full
+4,CRN,Crows Nest,Crows Nest,Underground,0,Full
+5,VCX,Victoria Cross,North Sydney,Underground,0,Full
+6,BRG,Barangaroo,Barangaroo,Underground,0,Full
+7,WYN,Wynyard,Sydney CBD,Interchange Hub,1,Full
+8,TWH,Town Hall,Sydney CBD,Interchange Hub,1,Full
+9,CEN,Central,Haymarket,Interchange Hub,1,Full
+10,RDF,Redfern,Redfern,Interchange Hub,1,Partial
+11,WTL,Waterloo,Waterloo,Underground,0,Full
+12,SYD,Sydenham,Sydenham,Interchange Hub,1,Partial
+13,GSQ,Green Square,Zetland,Underground,0,Full
+14,MSC,Mascot,Mascot,Underground,0,Full
+15,DOM,Domestic Airport,Mascot,Underground,0,Full
+16,INT,International Airport,Mascot,Underground,0,Full
+17,WOL,Wolli Creek,Wolli Creek,Elevated,0,Full
+18,ASH,Ashfield,Ashfield,Surface,0,Limited
+19,BUR,Burwood,Burwood,Surface,0,Partial
+20,STR,Strathfield,Strathfield,Interchange Hub,1,Partial
+21,LID,Lidcombe,Lidcombe,Surface,0,Partial
+22,GRV,Granville,Granville,Surface,0,Limited
+23,HRP,Harris Park,Harris Park,Surface,0,Limited
+24,PAR,Parramatta,Parramatta,Elevated,0,Full
+25,WMD,Westmead,Westmead,Surface,0,Full
+26,CCW,Concord West,Concord West,Surface,0,Limited
+27,RHD,Rhodes,Rhodes,Elevated,0,Full
+28,MDB,Meadowbank,Meadowbank,Surface,0,Partial
+29,EPP,Epping,Epping,Underground,0,Full
+30,MQU,Macquarie University,Macquarie Park,Underground,0,Full
+31,MQP,Macquarie Park,Macquarie Park,Underground,0,Full
+32,NRY,North Ryde,North Ryde,Underground,0,Full

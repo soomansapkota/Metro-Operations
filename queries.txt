@@ -1,0 +1,118 @@
+// =====================================================================
+// Metro Operations - Cypher query use cases (Assessment 4, Task 3)
+// Sydney Group 21.  Run after import.txt.  Ordered by increasing complexity.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// USE CASE 1 (Basic) - Fleet availability check
+// Scenario: Each morning the fleet controller needs every train that is NOT
+// available for service, its odometer reading and when it was last
+// maintained, so replacement units can be rostered.
+// Features: label scan + property filter, OPTIONAL MATCH, aggregation,
+// ordering. (Graph equivalent of SQL use case 1 in Assessment 2.)
+// ---------------------------------------------------------------------
+MATCH (t:Train)
+WHERE t.serviceStatus <> 'In Service'
+OPTIONAL MATCH (t)-[:UNDERWENT]->(m:MaintenanceLog)
+RETURN t.fleetNumber           AS train,
+       t.serviceStatus         AS status,
+       t.odometerKm            AS odometerKm,
+       count(m)                AS maintenanceJobs,
+       max(m.maintenanceDate)  AS lastMaintenance
+ORDER BY odometerKm DESC;
+
+
+// ---------------------------------------------------------------------
+// USE CASE 2 (Intermediate) - Interchange crowding in the AM peak
+// Scenario: Station operations want to know which interchange stations carry
+// the heaviest AM-peak (07:00-09:00) train calls, which lines meet there and
+// how full arriving trains are, to plan platform staff deployment.
+// Features: multi-hop pattern through the weak entity Platform, temporal
+// filter on a relationship property, collect(DISTINCT), avg, multiple
+// aggregation levels.
+// ---------------------------------------------------------------------
+MATCH (s:Station {isInterchange: true})-[:HAS_PLATFORM]->(p:Platform)<-[c:CALLS_AT]-(t:Trip)
+WHERE c.scheduledArrival >= localtime('07:00')
+  AND c.scheduledArrival <  localtime('09:00')
+  AND t.tripStatus IN ['Completed', 'Delayed']
+MATCH (t)<-[:SCHEDULES]-(:Route)<-[:OPERATES]-(l:MetroLine)
+WITH s,
+     count(DISTINCT p)                    AS platformsUsed,
+     count(c)                             AS peakCalls,
+     round(avg(t.occupancyPercent), 1)    AS avgOccupancyPct,
+     sum(CASE WHEN t.occupancyPercent >= 85 THEN 1 ELSE 0 END) AS crowdedCalls,
+     collect(DISTINCT l.lineCode)         AS lines
+RETURN s.stationName AS interchange, lines, platformsUsed, peakCalls,
+       avgOccupancyPct, crowdedCalls
+ORDER BY peakCalls DESC, avgOccupancyPct DESC;
+
+
+// ---------------------------------------------------------------------
+// USE CASE 3 (Advanced) - Journey planner with interchange detection
+// Scenario: The customer information system must suggest the route between
+// two stations with the fewest stops; among equally short options choose the
+// shortest distance, and tell the passenger where to change lines.
+// Features: allShortestPaths over the derived CONNECTED_TO network
+// (undirected), path functions nodes()/relationships(), reduce(),
+// list comprehension, list predicate none().
+// ---------------------------------------------------------------------
+MATCH p = allShortestPaths(
+      (:Station {stationName: 'Westmead'})-[:CONNECTED_TO*..30]-(:Station {stationName: 'International Airport'}))
+WITH p, nodes(p) AS st, relationships(p) AS seg,
+     reduce(km = 0.0, r IN relationships(p) | km + r.distanceKm) AS totalKm
+ORDER BY totalKm ASC
+LIMIT 1
+RETURN [s IN st | s.stationName]                                   AS journey,
+       size(seg)                                                   AS stops,
+       round(totalKm, 1)                                           AS distanceKm,
+       [i IN range(0, size(seg) - 2)
+          WHERE none(x IN seg[i].lines WHERE x IN seg[i + 1].lines)
+          | st[i + 1].stationName]                                 AS changeAt,
+       seg[0].lines                                                AS boardLine;
+
+
+// ---------------------------------------------------------------------
+// USE CASE 4 (Complex) - Disruption cascade and maintenance follow-up
+// Scenario: After a serious train fault the reliability engineer needs, for
+// every High/Critical train-caused disruption: the trips hit directly, the
+// later trips of the same train that day that inherited the problem (up to
+// 3 hops along NEXT_TRIP), whether those knock-on trips were actually
+// recorded in AFFECTS, the passengers exposed, the driver who reported it and
+// the last maintenance job done on that train before the fault.
+// Features: polymorphic CAUSED_BY, variable-length path, CALL subqueries with
+// scoped variables, COUNT {} existential subquery, pattern-based filtering,
+// temporal comparison between date and localdatetime.
+// ---------------------------------------------------------------------
+MATCH (d:ServiceDisruption)-[:CAUSED_BY]->(tr:Train)
+WHERE d.severityLevel IN ['High', 'Critical']
+MATCH (d)-[a:AFFECTS {impactType: 'Direct'}]->(t0:Trip)
+OPTIONAL MATCH (rep:Staff)-[:REPORTED]->(d)
+CALL (d, t0) {
+  OPTIONAL MATCH (t0)-[:NEXT_TRIP*1..3]->(k:Trip)
+  WITH k WHERE k IS NOT NULL
+  RETURN collect(k.tripCode) AS downstream,
+         sum(CASE WHEN COUNT { (d)-[:AFFECTS]->(k) } = 0 THEN 1 ELSE 0 END) AS unrecorded
+}
+CALL (d, tr) {
+  OPTIONAL MATCH (tr)-[:UNDERWENT]->(m:MaintenanceLog)<-[:PERFORMED]-(tech:Technician)
+  WHERE m.maintenanceDate < date(d.startDateTime)
+  WITH m, tech ORDER BY m.maintenanceDate DESC
+  LIMIT 1
+  RETURN m.maintenanceDate AS lastJob, m.category AS lastJobType,
+         tech.firstName + ' ' + tech.lastName AS lastTechnician
+}
+WITH d, tr, rep, t0, a, downstream, unrecorded, lastJob, lastJobType, lastTechnician,
+     COLLECT { MATCH (d)-[x:AFFECTS]->(:Trip) RETURN x.passengersAffected } AS paxList
+RETURN d.disruptionId                             AS id,
+       d.disruptionType                           AS type,
+       d.severityLevel                            AS severity,
+       tr.fleetNumber                             AS train,
+       t0.tripCode                                AS directTrip,
+       a.delayMinutes                             AS delayMin,
+       downstream                                 AS knockOnRisk,
+       unrecorded                                 AS unrecordedKnockOns,
+       reduce(s = 0, x IN paxList | s + x)        AS totalPassengers,
+       rep.firstName + ' ' + rep.lastName         AS reportedBy,
+       lastJob, lastJobType, lastTechnician
+ORDER BY totalPassengers DESC;

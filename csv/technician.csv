@@ -1,0 +1,15 @@
+StaffID,TradeSpecialisation,SafetyClearanceLevel,ToolkitAssetTag
+37,Electrical,1,TK-5000
+38,Mechanical,2,TK-5013
+39,Brakes,3,TK-5026
+40,Signalling,4,TK-5039
+41,HVAC,1,TK-5052
+42,Doors,2,TK-5065
+43,Traction,3,TK-5078
+44,Electrical,4,TK-5091
+45,Mechanical,1,TK-5104
+46,Brakes,2,TK-5117
+47,Signalling,3,TK-5130
+48,HVAC,4,TK-5143
+49,Doors,1,TK-5156
+50,Traction,2,TK-5169

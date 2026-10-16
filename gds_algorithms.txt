@@ -1,0 +1,183 @@
+
+// Metro Operations - Graph Data Science 
+
+
+
+// TASK 4 - CENTRALITY: "Which stations are the network's chokepoints?"
+
+
+// 4.0 Project the physical station network (undirected track segments)
+CALL gds.graph.drop('stationNetwork', false) YIELD graphName RETURN graphName;
+
+CALL gds.graph.project(
+  'stationNetwork',
+  'Station',
+  { CONNECTED_TO: { orientation: 'UNDIRECTED', properties: 'distanceKm' } }
+)
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount;
+
+// 4.1 Degree centrality - number of directly connected neighbour stations
+CALL gds.degree.stream('stationNetwork')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, score AS degree
+ORDER BY degree DESC, station LIMIT 10;
+
+// 4.2 PageRank - influence through well-connected neighbours
+CALL gds.pageRank.stream('stationNetwork', { maxIterations: 20, dampingFactor: 0.85 })
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 4) AS pageRank
+ORDER BY pageRank DESC LIMIT 10;
+
+// 4.3 ArticleRank - PageRank variant that dampens the effect of high-degree neighbours
+CALL gds.articleRank.stream('stationNetwork')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 4) AS articleRank
+ORDER BY articleRank DESC LIMIT 10;
+
+// 4.4 Eigenvector centrality - connected to other important stations
+CALL gds.eigenvector.stream('stationNetwork', { maxIterations: 50 })
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 4) AS eigenvector
+ORDER BY eigenvector DESC LIMIT 10;
+
+// 4.5 Closeness and harmonic centrality - how quickly a station reaches all others
+CALL gds.closeness.stream('stationNetwork')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 4) AS closeness
+ORDER BY closeness DESC LIMIT 10;
+
+CALL gds.closeness.harmonic.stream('stationNetwork')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 4) AS harmonic
+ORDER BY harmonic DESC LIMIT 10;
+
+// 4.6 Betweenness centrality - share of shortest journeys passing through a station
+CALL gds.betweenness.stream('stationNetwork')
+YIELD nodeId, score
+RETURN gds.util.asNode(nodeId).stationName AS station, round(score, 1) AS betweenness
+ORDER BY betweenness DESC LIMIT 10;
+
+// 4.7 Persist the chosen measures to the database
+CALL gds.betweenness.write('stationNetwork', { writeProperty: 'betweenness' })
+YIELD nodePropertiesWritten, centralityDistribution
+RETURN nodePropertiesWritten, centralityDistribution.max AS maxScore;
+
+CALL gds.pageRank.write('stationNetwork', { writeProperty: 'pageRank' })
+YIELD nodePropertiesWritten, ranIterations
+RETURN nodePropertiesWritten, ranIterations;
+
+// 4.8 Use case - resilience priority list: structural importance x observed disruption
+MATCH (s:Station)
+OPTIONAL MATCH (d:ServiceDisruption)-[:CAUSED_BY]->(s)
+OPTIONAL MATCH (d)-[a:AFFECTS]->(:Trip)
+WITH s, count(DISTINCT d) AS incidents, coalesce(sum(a.passengersAffected), 0) AS paxAffected
+WITH s, incidents, paxAffected,
+     COUNT { (s)-[:HAS_PLATFORM]->(:Platform)<-[:CALLS_AT]-(:Trip) } AS trainCalls
+RETURN s.stationName AS station, s.isInterchange AS interchange,
+       round(s.betweenness, 1) AS betweenness, round(s.pageRank, 3) AS pageRank,
+       trainCalls, incidents, paxAffected,
+       CASE WHEN s.betweenness >= 150 AND incidents >= 2 THEN 'Priority 1 - harden now'
+            WHEN s.betweenness >= 150 OR incidents >= 2  THEN 'Priority 2 - contingency plan'
+            ELSE 'Monitor' END AS action
+ORDER BY betweenness DESC LIMIT 12;
+
+CALL gds.graph.drop('stationNetwork') YIELD graphName RETURN graphName;
+
+
+// #####################################################################
+// TASK 5 - SIMILARITY: "Who is the best cover driver?"
+// #####################################################################
+
+// 5.0 Bipartite projection Driver -> Route, weighted by trips driven
+CALL gds.graph.drop('driverRoute', false) YIELD graphName RETURN graphName;
+
+MATCH (d:Driver)-[:HAS_ALLOCATION]->(:DriverAllocation)-[:FOR_TRIP]->(:Trip)<-[:SCHEDULES]-(r:Route)
+WITH d, r, count(*) AS trips
+RETURN gds.graph.project(
+  'driverRoute', d, r,
+  { sourceNodeLabels: 'Driver', targetNodeLabels: 'Route',
+    relationshipType: 'DROVE_ON', relationshipProperties: { trips: trips } }
+) AS g;
+
+// 5.1 Node Similarity - Jaccard (shared routes / all routes of either driver)
+CALL gds.nodeSimilarity.stream('driverRoute', { similarityMetric: 'JACCARD', topK: 3 })
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS d1, gds.util.asNode(node2) AS d2, similarity
+RETURN d1.employeeNumber AS driver, d2.employeeNumber AS similarDriver, round(similarity, 3) AS jaccard
+ORDER BY jaccard DESC, driver, similarDriver LIMIT 10;
+
+// 5.2 Node Similarity - Overlap (shared routes / routes of the smaller set)
+CALL gds.nodeSimilarity.stream('driverRoute', { similarityMetric: 'OVERLAP', topK: 3 })
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS d1, gds.util.asNode(node2) AS d2, similarity
+RETURN d1.employeeNumber AS driver, d2.employeeNumber AS similarDriver, round(similarity, 3) AS overlap
+ORDER BY overlap DESC, driver, similarDriver LIMIT 10;
+
+// 5.3 Node Similarity - weighted Jaccard using trip counts (route familiarity)
+CALL gds.nodeSimilarity.stream('driverRoute',
+  { similarityMetric: 'JACCARD', relationshipWeightProperty: 'trips', topK: 3 })
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS d1, gds.util.asNode(node2) AS d2, similarity
+RETURN d1.employeeNumber AS driver, d2.employeeNumber AS similarDriver, round(similarity, 3) AS weightedJaccard
+ORDER BY weightedJaccard DESC, driver, similarDriver LIMIT 10;
+
+// 5.4 Node Similarity - Cosine on weighted trip counts
+CALL gds.nodeSimilarity.stream('driverRoute',
+  { similarityMetric: 'COSINE', relationshipWeightProperty: 'trips', topK: 3 })
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS d1, gds.util.asNode(node2) AS d2, similarity
+RETURN d1.employeeNumber AS driver, d2.employeeNumber AS similarDriver, round(similarity, 3) AS cosine
+ORDER BY cosine DESC, driver, similarDriver LIMIT 10;
+
+// 5.5 K-Nearest Neighbours on a route-familiarity vector property
+//     (vector = trips driven on R01..R10, stored on each Driver)
+MATCH (r:Route) WITH r ORDER BY r.routeId
+WITH collect(r) AS routes
+MATCH (d:Driver)
+SET d.routeProfile = [r IN routes |
+      toFloat(COUNT { (d)-[:HAS_ALLOCATION]->(:DriverAllocation)-[:FOR_TRIP]->(:Trip)<-[:SCHEDULES]-(r) })];
+
+CALL gds.graph.drop('driverProfile', false) YIELD graphName RETURN graphName;
+
+CALL gds.graph.project('driverProfile', { Driver: { properties: 'routeProfile' } }, '*')
+YIELD graphName, nodeCount
+RETURN graphName, nodeCount;
+
+CALL gds.knn.stream('driverProfile', {
+  nodeProperties: { routeProfile: 'COSINE' }, topK: 3,
+  sampleRate: 1.0, deltaThreshold: 0.0, randomSeed: 42, concurrency: 1 })
+YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS d1, gds.util.asNode(node2) AS d2, similarity
+RETURN d1.employeeNumber AS driver, d2.employeeNumber AS similarDriver, round(similarity, 3) AS knnCosine
+ORDER BY knnCosine DESC, driver, similarDriver LIMIT 10;
+
+// 5.6 Spot-check with the similarity functions (no projection needed)
+MATCH (a:Driver {employeeNumber: 'E1001'}), (b:Driver {employeeNumber: 'E1033'})
+RETURN round(gds.similarity.cosine(a.routeProfile, b.routeProfile), 3)     AS cosine,
+       round(gds.similarity.euclidean(a.routeProfile, b.routeProfile), 3)  AS euclideanSim,
+       round(gds.similarity.overlap(
+         [i IN range(0, 9) WHERE a.routeProfile[i] > 0], [i IN range(0, 9) WHERE b.routeProfile[i] > 0]), 3) AS overlap,
+       round(gds.similarity.jaccard(
+         [i IN range(0, 9) WHERE a.routeProfile[i] > 0], [i IN range(0, 9) WHERE b.routeProfile[i] > 0]), 3) AS jaccard;
+
+// 5.7 Persist the chosen measure (weighted Jaccard) as SIMILAR_ROUTES relationships
+CALL gds.nodeSimilarity.write('driverRoute', {
+  similarityMetric: 'JACCARD', relationshipWeightProperty: 'trips', topK: 5,
+  writeRelationshipType: 'SIMILAR_ROUTES', writeProperty: 'score' })
+YIELD nodesCompared, relationshipsWritten
+RETURN nodesCompared, relationshipsWritten;
+
+// 5.8 Use case - driver E1001 (Liam Nguyen, rostered on TR001/TR003) calls in sick for the 14 Sep AM shift:
+//     recommend cover drivers who know the same routes, hold a valid licence
+//     and are not already rostered on that shift.
+MATCH (sick:Driver {employeeNumber: 'E1001'})-[:HAS_ALLOCATION]->(:DriverAllocation)-[:IN_SHIFT]->(sh:Shift {shiftCode: 'SH0914-AM'})
+WITH DISTINCT sick, sh
+MATCH (sick)-[s:SIMILAR_ROUTES]->(c:Driver)
+WHERE c.licenceExpiryDate > sh.shiftDate
+  AND NOT EXISTS { (c)-[:HAS_ALLOCATION]->(:DriverAllocation)-[:IN_SHIFT]->(sh) }
+RETURN c.employeeNumber AS coverDriver, c.firstName + ' ' + c.lastName AS name,
+       c.certificationLevel AS certification, round(s.score, 3) AS similarity,
+       COLLECT { MATCH (c)-[:HAS_ALLOCATION]->(:DriverAllocation)-[:FOR_TRIP]->(:Trip)<-[:SCHEDULES]-(rt:Route)
+                 RETURN DISTINCT rt.routeCode AS code ORDER BY code } AS knownRoutes
+ORDER BY similarity DESC;

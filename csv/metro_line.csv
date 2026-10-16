@@ -1,0 +1,5 @@
+LineID,LineCode,LineName,RouteLengthKm,OperatingStatus
+1,L1,Harbour Line,15.7,Operational
+2,L2,Airport Line,15.4,Operational
+3,L3,Western Line,23.7,Operational
+4,L4,Northern Line,20.8,Operational

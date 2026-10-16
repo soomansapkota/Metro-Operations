@@ -1,0 +1,11 @@
+RouteID,RouteCode,LineID,DirectionCode,OriginStationID,ScheduledDurationMin,StoppingPattern,RouteName
+1,R01,1,NB,12,38,All Stops,Harbour Northbound
+2,R02,1,SB,1,38,All Stops,Harbour Southbound
+3,R03,2,OB,7,21,Express,Airport Express
+4,R04,2,OB,7,33,All Stops,Airport Outbound
+5,R05,2,IB,12,33,All Stops,Airport Inbound
+6,R06,3,WB,8,47,All Stops,Western Westbound
+7,R07,3,EB,25,47,All Stops,Western Eastbound
+8,R08,4,NB,20,40,All Stops,Northern Northbound
+9,R09,4,SB,1,40,All Stops,Northern Southbound
+10,R10,3,WB,8,40,Limited Stops,Western Express
